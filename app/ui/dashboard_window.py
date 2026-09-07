@@ -55,7 +55,7 @@ class KPI_Card(QFrame):
         icon_label.setPixmap(
             qta.icon(
                 icon,
-                color="#2563EB"
+                color="#CE1794"
             ).pixmap(
                 28,
                 28
