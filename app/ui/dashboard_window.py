@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QMessageBox
 )
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 import qtawesome as qta
 import sys
@@ -93,10 +93,20 @@ class KPI_Card(QFrame):
 
 class DashboardWindow(QWidget):
 
+    #: Emitted when the user asks to sign out. The controller answers it by
+    #: ending the session and bringing the sign-in window back.
+    logout_requested = Signal()
+
+    #: Emitted when the user opens the approval queue. Only ever reachable by
+    #: someone holding Permission.APPROVE_REGISTRATIONS, because the button is
+    #: not built for anybody else.
+    approvals_requested = Signal()
+
     def __init__(
         self,
         username="Nadee",
-        role="Owner"
+        role="Owner",
+        can_approve=False
     ):
 
         super().__init__()
@@ -104,6 +114,13 @@ class DashboardWindow(QWidget):
 
         self.username = username
         self.role = role
+
+        #: Whether this user may see the approval queue at all. Passed in
+        #: rather than worked out here, because the dashboard is handed display
+        #: strings and has no business asking the session about permissions.
+        self.can_approve = can_approve
+
+        self.pending_count = 0
 
         self.dark_mode = False
 
@@ -282,12 +299,35 @@ class DashboardWindow(QWidget):
             )
 
 
+        self.approvals_btn = MenuButton(
+            "fa5s.user-check",
+            "Approvals"
+        )
+
+        self.approvals_btn.clicked.connect(
+            self.approvals_requested
+        )
+
+        self.approvals_btn.setVisible(
+            self.can_approve
+        )
+
+
+        side_layout.addWidget(
+            self.approvals_btn
+        )
+
+
         side_layout.addStretch()
 
 
         logout = MenuButton(
             "fa5s.sign-out-alt",
             "Logout"
+        )
+
+        logout.clicked.connect(
+            self.confirm_logout
         )
 
 
@@ -661,6 +701,40 @@ class DashboardWindow(QWidget):
             """
 
         )
+
+
+
+    def set_pending_count(self, count):
+        """Show how many sign-ups are waiting, on the sidebar button.
+
+        Kept visible at zero for anyone who may approve — an empty queue is
+        still worth being able to open and confirm.
+        """
+        self.pending_count = max(0, int(count or 0))
+
+        self.approvals_btn.setText(
+            f"Approvals ({self.pending_count})"
+            if self.pending_count
+            else "Approvals"
+        )
+
+        self.approvals_btn.setVisible(
+            self.can_approve
+        )
+
+
+    def confirm_logout(self):
+
+        result = QMessageBox.question(
+            self,
+            "Sign out",
+            f"Sign {self.username} out of this terminal?"
+        )
+
+
+        if result == QMessageBox.StandardButton.Yes:
+
+            self.logout_requested.emit()
 
 
 

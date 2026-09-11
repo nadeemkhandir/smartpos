@@ -1,0 +1,10 @@
+
+# SmartPOS
+.env
+logs/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+.venv/

@@ -4,16 +4,20 @@ SmartPOS — sign-in screen.
 Integration contract for the rest of the app:
 
     window = LoginWindow()
-    window.login_attempted.connect(on_login)      # (username, password, remember)
+    window.login_attempted.connect(on_login)              # (username, password)
+    window.forgot_password_requested.connect(on_forgot)   # open the reset dialog
+    window.register_requested.connect(on_register)        # open the sign-up dialog
 
-    def on_login(username, password, remember):
+    def on_login(username, password):
         window.set_busy(True)                     # while authenticating
         ...
         window.show_error("Invalid username or password.")   # on failure
         window.set_busy(False)
 
 The window never authenticates on its own: it validates that the fields are
-filled, then hands the credentials over and waits.
+filled, then hands the credentials over and waits. Everything behind that
+signal - the database, hashing, lockouts, the reset passcode - belongs to
+``app/services`` and is wired up by ``app.ui.auth_controller``.
 """
 
 from __future__ import annotations
@@ -26,7 +30,6 @@ from PySide6.QtCore import (
     QEasingCurve,
     QPropertyAnimation,
     QRect,
-    QRectF,
     QSettings,
     QSize,
     Qt,
@@ -37,15 +40,11 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor,
     QKeySequence,
-    QPainter,
-    QPainterPath,
     QPalette,
-    QPen,
     QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
@@ -58,81 +57,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.core.config import settings
+from app.ui.theme import DARK, LIGHT
+
 APP_NAME = "SmartPOS"
 APP_VERSION = "1.0.0"
 TERMINAL_ID = "01"
 
 
-# ============================================================
-# DESIGN TOKENS
-# ============================================================
-# Semantic names (surface / text_muted / danger) instead of raw hex at the
-# call site, so a colour only ever has to change in one place and both themes
-# stay structurally identical.
-
-LIGHT = {
-    "app_bg": "#EDF1F7",
-    "surface": "#FFFFFF",
-    "field_bg": "#F7F9FC",
-    "border": "#E3E8F0",
-    "border_strong": "#C9D3E0",
-    "text": "#0F172A",
-    "text_secondary": "#475569",
-    "text_muted": "#64748B",
-    "primary": "#1473EA",
-    "primary_hover": "#1065CF",
-    "primary_active": "#0B54AD",
-    "primary_soft": "#E6F0FD",
-    "link": "#1364CE",
-    "danger": "#C81E1E",
-    "danger_soft": "#FDECEC",
-    "danger_border": "#F5C2C2",
-    "warning": "#9A5B06",
-    "warning_soft": "#FDF3E3",
-    "chrome_hover": "#E2E8F0",
-    "disabled_bg": "#C9D3E0",
-    "disabled_text": "#4E5E76",
-    "brand_from": "#062B5B",
-    "brand_to": "#0C4B93",
-    "brand_chip": "#12457F",
-    "brand_icon": "#A8CBF4",
-    "brand_text": "#FFFFFF",
-    "brand_text_muted": "#BFD5EE",
-    "brand_divider": "#1B4E88",
-    "shadow": (15, 23, 42, 46),
-}
-
-DARK = {
-    "app_bg": "#070D18",
-    "surface": "#121B2C",
-    "field_bg": "#0D1524",
-    "border": "#26324A",
-    "border_strong": "#38475F",
-    "text": "#EEF2F8",
-    "text_secondary": "#A8B8CD",
-    "text_muted": "#7C8FA9",
-    "primary": "#3B82F6",
-    "primary_hover": "#5896F8",
-    "primary_active": "#2A6CDC",
-    "primary_soft": "#152744",
-    "link": "#8FBEFC",
-    "danger": "#F87171",
-    "danger_soft": "#2A1620",
-    "danger_border": "#5B2731",
-    "warning": "#FBBF24",
-    "warning_soft": "#2A2113",
-    "chrome_hover": "#1E293B",
-    "disabled_bg": "#253148",
-    "disabled_text": "#95A7BF",
-    "brand_from": "#04101F",
-    "brand_to": "#0A2E5A",
-    "brand_chip": "#123256",
-    "brand_icon": "#8FB6EC",
-    "brand_text": "#F1F6FC",
-    "brand_text_muted": "#A9C0DC",
-    "brand_divider": "#153A66",
-    "shadow": (0, 0, 0, 130),
-}
 
 
 def caps_lock_on() -> bool:
@@ -214,77 +146,6 @@ class LinkLabel(QLabel):
         super().keyPressEvent(event)
 
 
-class ThemedCheckBox(QCheckBox):
-    """Checkbox painted by hand so the tick mark can follow the active theme.
-
-    Qt stylesheets can only supply a tick through `image: url(...)`, which would
-    mean shipping a PNG per theme; painting keeps it vector-crisp and recolourable.
-    """
-
-    BOX = 20
-    GAP = 11
-
-    def __init__(self, text="", parent=None):
-        super().__init__(text, parent)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
-        self._tokens = LIGHT
-
-    def apply_theme(self, tokens):
-        self._tokens = tokens
-        self.update()
-
-    def sizeHint(self):
-        hint = super().sizeHint()
-        return QSize(hint.width() + self.GAP, max(hint.height(), self.BOX + 8))
-
-    def paintEvent(self, event):
-        tokens = self._tokens
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        box = QRectF(1, (self.height() - self.BOX) / 2, self.BOX, self.BOX)
-
-        if self.isChecked():
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(tokens["primary"]))
-            painter.drawRoundedRect(box, 6, 6)
-
-            tick = QPen(QColor("#FFFFFF"), 2.1)
-            tick.setCapStyle(Qt.PenCapStyle.RoundCap)
-            tick.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            painter.setPen(tick)
-            path = QPainterPath()
-            path.moveTo(box.left() + 5.2, box.top() + 10.4)
-            path.lineTo(box.left() + 8.4, box.top() + 13.6)
-            path.lineTo(box.left() + 14.9, box.top() + 6.6)
-            painter.drawPath(path)
-        else:
-            painter.setBrush(QColor(tokens["field_bg"]))
-            edge = tokens["primary"] if self.underMouse() else tokens["border_strong"]
-            painter.setPen(QPen(QColor(edge), 1.4))
-            painter.drawRoundedRect(box.adjusted(0.7, 0.7, -0.7, -0.7), 6, 6)
-
-        if self.hasFocus():
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor(tokens["primary"]), 1.3))
-            painter.drawRoundedRect(box.adjusted(-3.5, -3.5, 3.5, 3.5), 9, 9)
-
-        painter.setPen(QColor(tokens["text_secondary"]))
-        painter.setFont(self.font())
-        text_area = QRectF(
-            self.BOX + self.GAP,
-            0,
-            self.width() - self.BOX - self.GAP,
-            self.height(),
-        )
-        painter.drawText(
-            text_area,
-            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            self.text(),
-        )
-
-
 class FeatureRow(QWidget):
     """Icon chip + label pair used on the brand panel."""
 
@@ -328,8 +189,16 @@ class FeatureRow(QWidget):
 
 
 class LoginWindow(QWidget):
-    #: Emitted once both fields are filled in. (username, password, remember)
-    login_attempted = Signal(str, str, bool)
+    #: Emitted once both fields are filled in. (username, password)
+    login_attempted = Signal(str, str)
+
+    #: Emitted when "Create one" is clicked. The controller answers it by
+    #: opening the registration dialog. Hidden entirely when sign-up is off.
+    register_requested = Signal()
+
+    #: Emitted when "Forgot password?" is clicked. The controller answers it by
+    #: opening the reset dialog; the window itself knows nothing about e-mail.
+    forgot_password_requested = Signal()
 
     #: Below this width the brand panel is dropped so the form keeps breathing room.
     BRAND_BREAKPOINT = 1040
@@ -350,7 +219,7 @@ class LoginWindow(QWidget):
         self._build_ui()
         self._wire_events()
         self._apply_theme()
-        self._restore_preferences()
+        self.username.setFocus()
 
         self.showFullScreen()
 
@@ -584,16 +453,12 @@ class LoginWindow(QWidget):
         caps_layout.addStretch()
         self.caps_row.setVisible(False)
 
-        self.remember = ThemedCheckBox("Remember me")
-        self.remember.setAccessibleName("Remember me")
-
         self.forgot = LinkLabel("Forgot password?")
         self.forgot.setObjectName("forgot")
         self.forgot.setAccessibleName("Forgot password")
 
         options = QHBoxLayout()
         options.setContentsMargins(0, 0, 0, 0)
-        options.addWidget(self.remember)
         options.addStretch()
         options.addWidget(self.forgot)
 
@@ -652,6 +517,8 @@ class LoginWindow(QWidget):
         layout.addWidget(self.error_banner)
         layout.addSpacing(14)
         layout.addWidget(self.login_btn)
+        layout.addSpacing(18)
+        layout.addLayout(self._build_register_row())
 
         self.card_shadow = QGraphicsDropShadowEffect(self)
         self.card_shadow.setBlurRadius(56)
@@ -659,6 +526,33 @@ class LoginWindow(QWidget):
         card.setGraphicsEffect(self.card_shadow)
 
         return card
+
+    def _build_register_row(self) -> QHBoxLayout:
+        """The "No account yet?" line under the sign-in button.
+
+        Hidden outright when ``REGISTRATION_ENABLED`` is off, rather than shown
+        and refused: a till that does not take sign-ups should not advertise
+        one.
+        """
+        self.register_prompt = QLabel("No account yet?")
+        self.register_prompt.setObjectName("register_prompt")
+
+        self.register_link = LinkLabel("Create one")
+        self.register_link.setObjectName("forgot")
+        self.register_link.setAccessibleName("Create an account")
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.addStretch()
+        row.addWidget(self.register_prompt)
+        row.addWidget(self.register_link)
+        row.addStretch()
+
+        enabled = settings.registration.enabled
+        self.register_prompt.setVisible(enabled)
+        self.register_link.setVisible(enabled)
+
+        return row
 
     def _wire_events(self):
         self.login_btn.clicked.connect(self.handle_login)
@@ -668,15 +562,16 @@ class LoginWindow(QWidget):
         self.password.textEdited.connect(self._on_typing)
 
         self.eye_action.triggered.connect(self._toggle_password)
-        self.forgot.clicked.connect(self.show_forgot_password_help)
+        self.forgot.clicked.connect(self.forgot_password_requested)
+        self.register_link.clicked.connect(self.register_requested)
         self.theme_btn.clicked.connect(self.toggle_theme)
         self.minimize_btn.clicked.connect(self.showMinimized)
         self.close_btn.clicked.connect(self.confirm_close)
 
         self.setTabOrder(self.username, self.password)
-        self.setTabOrder(self.password, self.remember)
-        self.setTabOrder(self.remember, self.forgot)
+        self.setTabOrder(self.password, self.forgot)
         self.setTabOrder(self.forgot, self.login_btn)
+        self.setTabOrder(self.login_btn, self.register_link)
 
         QShortcut(QKeySequence("F11"), self, self._toggle_fullscreen)
 
@@ -686,11 +581,14 @@ class LoginWindow(QWidget):
         self._clock.start()
         self._tick()
 
-    def _restore_preferences(self):
-        saved_user = self._settings.value("auth/remembered_username", "", type=str)
-        if saved_user:
-            self.username.setText(saved_user)
-            self.remember.setChecked(True)
+    def prefill(self, username: str = ""):
+        """Fill in the username this terminal last signed in with.
+
+        Called by the controller, which is the half of the application that
+        knows what was last used; the window only puts it on screen.
+        """
+        if username:
+            self.username.setText(username)
             self.password.setFocus()
         else:
             self.username.setFocus()
@@ -698,6 +596,15 @@ class LoginWindow(QWidget):
     # ---------------------------------------------------------
     # Theming
     # ---------------------------------------------------------
+
+    @property
+    def dark_mode(self) -> bool:
+        """Which palette the window is currently wearing.
+
+        Dialogs opened on top of it read this so the whole application changes
+        theme together.
+        """
+        return self._dark_mode
 
     @property
     def tokens(self) -> dict:
@@ -720,7 +627,6 @@ class LoginWindow(QWidget):
             field.setPalette(palette)
 
         self.card_shadow.setColor(QColor(*tokens["shadow"]))
-        self.remember.apply_theme(tokens)
         for row in self.feature_rows:
             row.apply_theme(tokens)
 
@@ -744,9 +650,9 @@ class LoginWindow(QWidget):
         self.caps_icon.setPixmap(
             qta.icon("fa5s.exclamation-triangle", color=tokens["warning"]).pixmap(13, 13)
         )
-        self.error_icon.setPixmap(
-            qta.icon("fa5s.exclamation-circle", color=tokens["danger"]).pixmap(15, 15)
-        )
+        # The banner does double duty as a failure and a success message, so
+        # repaint its icon in whichever role it is currently wearing.
+        self._paint_banner_icon()
 
         self.theme_btn.setIcon(
             qta.icon("fa5s.sun" if self._dark_mode else "fa5s.moon", color=muted)
@@ -922,6 +828,12 @@ class LoginWindow(QWidget):
             color: {t['warning']};
         }}
 
+        #register_prompt {{
+            color: {t['text_muted']};
+            font-size: 13px;
+            background: transparent;
+        }}
+
         #forgot {{
             color: {t['link']};
             font-size: 13px;
@@ -942,6 +854,18 @@ class LoginWindow(QWidget):
         }}
         #error_text {{
             color: {t['danger']};
+            font-size: 13px;
+            font-weight: 600;
+            background: transparent;
+        }}
+
+        #notice_banner {{
+            background: {t['success_soft']};
+            border: 1px solid {t['success_border']};
+            border-radius: 12px;
+        }}
+        #notice_text {{
+            color: {t['success']};
             font-size: 13px;
             font-weight: 600;
             background: transparent;
@@ -1071,12 +995,9 @@ class LoginWindow(QWidget):
 
         self.clear_error()
 
-        if self.remember.isChecked():
-            self._settings.setValue("auth/remembered_username", username)
-        else:
-            self._settings.remove("auth/remembered_username")
-
-        self.login_attempted.emit(username, password, self.remember.isChecked())
+        # Remembering the username for next time is the session layer's job,
+        # and it only happens once the credentials actually check out.
+        self.login_attempted.emit(username, password)
 
     # ---------------------------------------------------------
     # Public API for the authentication layer
@@ -1086,7 +1007,7 @@ class LoginWindow(QWidget):
         """Lock the form while credentials are being checked."""
         self._busy = busy
 
-        for widget in (self.username, self.password, self.remember, self.login_btn):
+        for widget in (self.username, self.password, self.login_btn):
             widget.setEnabled(not busy)
 
         if busy:
@@ -1104,6 +1025,32 @@ class LoginWindow(QWidget):
 
     def show_error(self, message: str):
         """Show a failure message under the form and reveal it with a slide."""
+        self._show_banner(message, success=False)
+
+        # A failed sign-in almost always means retyping the password, so hand
+        # the field over ready to be overwritten.
+        self.password.selectAll()
+
+    def show_notice(self, message: str):
+        """Show a *good news* message under the form — a sign-up went through.
+
+        Same widgets as :meth:`show_error`, different colours. Announcing a
+        successful registration in the red failure banner reads as something
+        having gone wrong, which is the opposite of what happened.
+        """
+        self._show_banner(message, success=True)
+
+    def _show_banner(self, message: str, *, success: bool):
+        self.error_banner.setObjectName("notice_banner" if success else "error_banner")
+        self.error_text.setObjectName("notice_text" if success else "error_text")
+
+        # Object names feed the stylesheet, so the widgets need re-polishing.
+        for widget in (self.error_banner, self.error_text):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+        self._paint_banner_icon()
+
         self.error_text.setText(message)
         animate = not self.error_banner.isVisible()
 
@@ -1120,12 +1067,23 @@ class LoginWindow(QWidget):
         if animate:
             self._reveal(self.error_banner, self.error_banner.height())
 
-        self.password.selectAll()
+    def _paint_banner_icon(self):
+        success = self.error_banner.objectName() == "notice_banner"
+        tokens = self.tokens
+
+        self.error_icon.setPixmap(
+            qta.icon(
+                "fa5s.check-circle" if success else "fa5s.exclamation-circle",
+                color=tokens["success" if success else "danger"],
+            ).pixmap(15, 15)
+        )
 
     def clear_error(self):
         self.error_banner.setVisible(False)
         self.error_text.clear()
         self.error_text.setMinimumHeight(0)
+        self.error_banner.setObjectName("error_banner")
+        self.error_text.setObjectName("error_text")
         self._mark_field(self.username, False)
         self._mark_field(self.password, False)
 
@@ -1174,15 +1132,6 @@ class LoginWindow(QWidget):
         anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
         self._reveal_anim = anim
 
-    def show_forgot_password_help(self):
-        QMessageBox.information(
-            self,
-            "Forgot password",
-            "Passwords are reset by an administrator.\n\n"
-            "Ask a manager to sign in and reset your password from "
-            "Settings → Users, then sign in again.",
-        )
-
     def confirm_close(self):
         answer = QMessageBox.question(
             self,
@@ -1199,7 +1148,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = LoginWindow()
 
-    def demo_auth(username, password, remember):
+    def demo_auth(username, password):
         window.set_busy(True)
 
         def finish():
